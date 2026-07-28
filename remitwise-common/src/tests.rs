@@ -1217,3 +1217,63 @@ fn test_require_active_pause_channel_paused() {
     // Channel is paused (true), should panic
     crate::require_active_pause_channel(&env, soroban_sdk::Symbol::short("PAYMENTS"));
 }
+
+// ─── same_address tests (#1141) ───────────────────────────────────────────────
+
+/// Two references to the same address value return `true`.
+#[test]
+fn test_same_address_equal_returns_true() {
+    use soroban_sdk::testutils::Address as _;
+    let env = Env::default();
+    let a = soroban_sdk::Address::generate(&env);
+    // b is a clone of a — they must compare equal.
+    let b = a.clone();
+    assert!(crate::same_address(&a, &b));
+}
+
+/// Two different address values return `false`.
+#[test]
+fn test_same_address_different_returns_false() {
+    use soroban_sdk::testutils::Address as _;
+    let env = Env::default();
+    let a = soroban_sdk::Address::generate(&env);
+    let b = soroban_sdk::Address::generate(&env);
+    // generate produces unique addresses each call.
+    assert!(!crate::same_address(&a, &b));
+}
+
+/// `same_address` does not consume either address — both remain usable after the call.
+#[test]
+fn test_same_address_does_not_consume_arguments() {
+    use soroban_sdk::testutils::Address as _;
+    let env = Env::default();
+    let owner = soroban_sdk::Address::generate(&env);
+    let caller = owner.clone();
+    // Call same_address — neither address should be moved.
+    let result = crate::same_address(&owner, &caller);
+    // Both addresses are still accessible here (no clone required by same_address itself).
+    assert!(result);
+    // Reuse the addresses to prove they were not consumed.
+    let _ = &owner;
+    let _ = &caller;
+}
+
+/// A single address is equal to itself (reflexivity).
+#[test]
+fn test_same_address_reflexive() {
+    use soroban_sdk::testutils::Address as _;
+    let env = Env::default();
+    let a = soroban_sdk::Address::generate(&env);
+    assert!(crate::same_address(&a, &a));
+}
+
+/// Symmetry: `same_address(a, b) == same_address(b, a)`.
+#[test]
+fn test_same_address_symmetric() {
+    use soroban_sdk::testutils::Address as _;
+    let env = Env::default();
+    let a = soroban_sdk::Address::generate(&env);
+    let b = soroban_sdk::Address::generate(&env);
+    assert_eq!(crate::same_address(&a, &b), crate::same_address(&b, &a));
+}
+
