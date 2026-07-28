@@ -1,7 +1,7 @@
 #![no_std]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use soroban_sdk::{contracterror, contracttype, symbol_short, Address, Bytes, BytesN, Env, Map, Symbol};
+use soroban_sdk::{contracterror, contracttype, symbol_short, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol};
 pub mod tokens;
 pub use tokens::{
     SupportedToken, BASE_UNITS_PER_EURC, BASE_UNITS_PER_USDC, DEFAULT_CURRENCY, EURC_DECIMALS,
@@ -135,6 +135,24 @@ pub const MAX_PAGE_LIMIT: u32 = 50;
 
 /// Max items returned in Top-N reports.
 pub const MAX_ITEMS_PER_REPORT: u32 = 10;
+/// Alias for MAX_ITEMS_PER_REPORT used by reporting contract.
+pub const MAX_TOP_N: u32 = MAX_ITEMS_PER_REPORT;
+
+/// Error returned when a top-N size exceeds the hard cap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TopNError;
+
+/// Requires that a top-N report size does not exceed the global cap.
+///
+/// This is a defence-in-depth guard that fails closed if a future
+/// code change raises `n` above `MAX_TOP_N`.
+pub fn require_bounded_top_n(n: u32, max: u32) -> Result<(), TopNError> {
+    if n > max {
+        Err(TopNError)
+    } else {
+        Ok(())
+    }
+}
 
 /// Helper to insert an item into a Top-N list (bounded).
 /// The list is maintained in sorted order based on the provided comparator.
@@ -257,8 +275,8 @@ pub enum SymbolError {
 }
 
 /// Returns [`SymbolError::SymbolTooLong`] when the symbol exceeds 9 bytes.
-pub fn require_valid_symbol_length(_env: &Env, sym: &Symbol) -> Result<(), SymbolError> {
-    let val: soroban_sdk::Val = (*sym).into();
+pub fn require_valid_symbol_length(env: &Env, sym: &Symbol) -> Result<(), SymbolError> {
+    let val: soroban_sdk::Val = sym.into_val(env);
     if val.is_object() {
         Err(SymbolError::SymbolTooLong)
     } else {
@@ -307,6 +325,39 @@ pub fn require_no_pending_dispute_epoch(env: &Env, ep: u64) -> Result<(), Disput
     let current_epoch: u64 = env.storage().instance().get(&symbol_short!("DISP_EP")).unwrap_or(0);
     if ep < current_epoch {
         return Err(DisputeError::OutdatedEpoch);
+    }
+    Ok(())
+}
+
+/// Typed error returned when a caller supplies an outdated cross-contract epoch.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum CrossContractEpochError {
+    /// The supplied cross-contract epoch does not match the current contract epoch.
+    EpochMismatch = 37,
+}
+
+pub const STORAGE_CROSS_CONTRACT_EPOCH: Symbol = symbol_short!("XC_EPOCH");
+
+/// Guards against executing cross-contract operations with a stale epoch.
+///
+/// This is a defence-in-depth fix. If a cross-contract message carrying an old epoch
+/// is replayed after the epoch has been bumped, it could lead to state corruption
+/// or unauthorised actions. Rejecting stale epochs ensures only fresh cross-contract
+/// calls are processed.
+///
+/// # Arguments
+/// * `env` - Soroban environment
+/// * `ep` - The cross-contract epoch supplied by the caller
+///
+/// # Returns
+/// * `Ok(())` if the epoch matches the current cross-contract epoch exactly
+/// * `Err(CrossContractEpochError::EpochMismatch)` if the epoch is outdated
+pub fn require_matching_cross_contract_epoch(env: &Env, ep: u64) -> Result<(), CrossContractEpochError> {
+    let current_epoch: u64 = env.storage().instance().get(&STORAGE_CROSS_CONTRACT_EPOCH).unwrap_or(0);
+    if ep != current_epoch {
+        return Err(CrossContractEpochError::EpochMismatch);
     }
     Ok(())
 }
@@ -364,18 +415,6 @@ pub enum SymbolLengthError {
     Empty = 1,
     /// The symbol name exceeds [`SYMBOL_SHORT_MAX_LEN`] bytes.
     TooLong = 2,
-}
-
-/// Error returned when a [`Symbol`] value exceeds the short-symbol limit (9 bytes).
-///
-/// Short symbols are stored inline in the [`Val`] bit pattern; long symbols use
-/// the heap-allocating `SymbolObject` XDR encoding.
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum SymbolError {
-    /// The symbol exceeds 9 bytes (too large for inline `symbol_short!` encoding).
-    SymbolTooLong = 1,
 }
 
 /// Validates that a candidate symbol name is within the bounds accepted by the
@@ -561,6 +600,19 @@ pub fn get_rate_limit_status(env: &Env, caller: &Address, operation: Symbol) -> 
     });
 
     (record.count, window_id + RATE_LIMIT_WINDOW_SECONDS)
+}
+
+/// Verifies that an amount is above the dust threshold (1 stroop).
+///
+/// Returns `Ok(())` when `amount > 1`, otherwise returns an error.
+/// This is a defence-in-depth check to prevent amounts that are
+/// economically meaningless (1 stroop = 0.0000001 XLM).
+pub fn verify_no_dust(amount: i128) -> Result<(), ()> {
+    if amount <= 1 {
+        Err(())
+    } else {
+        Ok(())
+    }
 }
 
 /// Normalizes caller-supplied pagination limits for all shared paginated reads.
@@ -1395,6 +1447,11 @@ pub fn validate_period(start: u64, end: u64) -> Result<(), TimeError> {
 #[repr(u32)]
 pub enum LedgerError {
     LedgerMismatch = 1,
+    /// The current ledger sequence is strictly less than a previously observed
+    /// value (`prev`). The Soroban host guarantees sequence monotonicity
+    /// (`docs/LEDGER_MONOTONICITY.md`), so a regression indicates either a
+    /// replay attempt, a stale read, or a logic bug at the call site.
+    LedgerSequenceRegression = 2,
 }
 
 /// Asserts that `expected` matches the current ledger sequence number.
@@ -1413,6 +1470,155 @@ pub fn require_matching_ledger(env: &Env, expected: u32) -> Result<(), LedgerErr
         Err(LedgerError::LedgerMismatch)
     } else {
         Ok(())
+    }
+}
+
+/// Asserts that the current ledger sequence is greater than or equal to a
+/// previously observed baseline (`prev`).
+///
+/// Defence-in-depth against off-by-N replay, stale-storage baseline after a
+/// contract upgrade, and `u32`-cast underflow: ties the caller-supplied (or
+/// cached) baseline to the authoritative source `env.ledger().sequence()`
+/// and rejects any regression at the call site.
+///
+/// The Soroban host already guarantees strict sequence monotonicity across
+/// ledgers (see `docs/LEDGER_MONOTONICITY.md`), but this helper closes the
+/// gap where contract code caches a `prev` baseline across calls and later
+/// compares against it — a regression-at-rest can otherwise let an
+/// authorization captured at `prev` be replayed at a smaller `curr`
+/// (fee updates, role grants, mint caps, etc.).
+///
+/// # Errors
+/// * [`LedgerError::LedgerSequenceRegression`] when
+///   `env.ledger().sequence() < prev`.
+/// * `Ok(())` on equal or monotonic-progression cases. Equality is
+///   tolerated so a baseline captured on the same ledger does not
+///   falsely reject a re-entry on that ledger.
+///
+/// # Recommended call-site pattern
+///
+/// ```ignore
+/// require_ledger_seq_monotonic(&env, prev_seq_baseline)
+///     .unwrap_or_else(|_| panic_with_error!(&env, MyError::LedgerRegression));
+/// ```
+pub fn require_ledger_seq_monotonic(env: &Env, prev: u32) -> Result<(), LedgerError> {
+    let current = env.ledger().sequence();
+    if current < prev {
+        Err(LedgerError::LedgerSequenceRegression)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ledger_monotonicity_tests {
+    //! Tests for [`require_ledger_seq_monotonic`] and the surrounding
+    //! [`LedgerError`] variants.
+    //!
+    //! The Soroban test host allows `env.ledger().set(...)` to mutate
+    //! both `sequence_number` and `timestamp` between calls, which lets
+    //! us write a regression scenario without depending on real
+    //! host-level sequencing behaviour.
+
+    use super::{require_ledger_seq_monotonic, LedgerError};
+    use soroban_sdk::testutils::LedgerInfo;
+    use soroban_sdk::Env;
+
+    /// Sets the ledger sequence and preserves other ledger state.
+    fn set_seq(env: &Env, sequence_number: u32) {
+        let proto = env.ledger().protocol_version();
+        env.ledger().set(LedgerInfo {
+            protocol_version: proto,
+            sequence_number,
+            timestamp: 1_700_000_000,
+            network_id: [0; 32],
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 3_000_000,
+        });
+    }
+
+    /// Acceptance contract: equal sequences are NOT a regression.
+    /// A baseline captured on the same ledger must re-validate cleanly.
+    #[test]
+    fn accepts_equal_baseline_and_current_sequence() {
+        let env = Env::default();
+        set_seq(&env, 100);
+        assert_eq!(require_ledger_seq_monotonic(&env, 100), Ok(()));
+    }
+
+    /// Positive progression: current > prev must succeed.
+    #[test]
+    fn accepts_monotonic_progression() {
+        let env = Env::default();
+        set_seq(&env, 101);
+        assert_eq!(require_ledger_seq_monotonic(&env, 100), Ok(()));
+    }
+
+    /// Large jump: e.g. after a network upgrade or test re-org, a much
+    /// higher current ledger must still pass.
+    #[test]
+    fn accepts_large_positive_jump() {
+        let env = Env::default();
+        set_seq(&env, 1_000_000);
+        assert_eq!(require_ledger_seq_monotonic(&env, 100), Ok(()));
+    }
+
+    /// Negative test (#1240): any current < prev must be rejected with
+    /// the typed error. This is the headline regression test — without
+    /// `require_ledger_seq_monotonic`, a replay at a lower ledger would
+    /// silently pass.
+    #[test]
+    fn rejects_regressed_sequence_by_one() {
+        let env = Env::default();
+        // prev = 100, current = 99 — regression by one.
+        set_seq(&env, 99);
+        assert_eq!(
+            require_ledger_seq_monotonic(&env, 100),
+            Err(LedgerError::LedgerSequenceRegression),
+        );
+    }
+
+    /// Negative test: large regression.
+    #[test]
+    fn rejects_regressed_sequence_by_large_amount() {
+        let env = Env::default();
+        set_seq(&env, 50);
+        assert_eq!(
+            require_ledger_seq_monotonic(&env, 1_000_000),
+            Err(LedgerError::LedgerSequenceRegression),
+        );
+    }
+
+    /// Boundary: `prev = 0` and `current = 0` is the genesis baseline —
+    /// must accept.
+    #[test]
+    fn accepts_genesis_baseline_zero() {
+        let env = Env::default();
+        set_seq(&env, 0);
+        assert_eq!(require_ledger_seq_monotonic(&env, 0), Ok(()));
+    }
+
+    /// Boundary: `prev = 0` and `current = 1` is the first legal
+    /// advancement — must accept.
+    #[test]
+    fn accepts_advancement_from_genesis() {
+        let env = Env::default();
+        set_seq(&env, 1);
+        assert_eq!(require_ledger_seq_monotonic(&env, 0), Ok(()));
+    }
+
+    /// u32 regression boundary: `prev = u32::MAX`, `current = u32::MAX - 1`.
+    /// Pins the saturation/underflow behaviour at the upper bound.
+    #[test]
+    fn rejects_regression_at_u32_max_boundary() {
+        let env = Env::default();
+        set_seq(&env, u32::MAX - 1);
+        assert_eq!(
+            require_ledger_seq_monotonic(&env, u32::MAX),
+            Err(LedgerError::LedgerSequenceRegression),
+        );
     }
 }
 
@@ -2460,6 +2666,196 @@ pub fn start_investigation_epoch(env: &Env, duration_secs: u64) {
 /// responsibility to gate it with admin auth.
 pub fn clear_investigation_epoch(env: &Env) {
     env.storage().instance().remove(&STORAGE_INVESTIGATION_EPOCH);
+}
+
+// ---------------------------------------------------------------------------
+// Kill switch — binary on/off gate to halt all writes
+// ---------------------------------------------------------------------------
+
+/// Storage key for the kill switch flag.
+/// When set to `true` in instance storage, all write entry points must reject
+/// mutations with [`KillSwitchError::WriteBlocked`].
+pub(crate) const STORAGE_KILL_SWITCH: Symbol = symbol_short!("KILL_SW");
+
+/// Error returned when a write operation is blocked because the kill switch
+/// is active.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum KillSwitchError {
+    /// A write was blocked because the kill switch is engaged and no further
+    /// state mutations are allowed.
+    WriteBlocked = 1,
+}
+
+/// Returns `true` if the kill switch is active, meaning all write operations
+/// must be halted.
+///
+/// Checks instance storage for a boolean `STORAGE_KILL_SWITCH` flag.
+/// If the flag is absent the kill switch is considered inactive (default).
+pub fn is_kill_switch_active(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&STORAGE_KILL_SWITCH)
+        .unwrap_or(false)
+}
+
+/// Halts write operations if the kill switch is active.
+///
+/// Call this at the top of every write entry point (bill payment, premium
+/// payment, remittance disbursement, etc.) as a defence-in-depth guard.
+/// When the kill switch is active the contract rejects any mutation with
+/// [`KillSwitchError::WriteBlocked`].
+///
+/// # Threat model
+/// Without this check, an attacker who has discovered a vulnerability or
+/// obtained administrative access can continue to mutate contract state even
+/// after the kill switch has been triggered — stealing remaining funds,
+/// corrupting state that would otherwise be preserved for forensic analysis,
+/// or escalating the attack by triggering additional write-side effects.
+/// Setting the kill switch limits the blast radius and preserves evidence
+/// for the investigation team.
+///
+/// Unlike the investigation epoch (which is time-bounded), the kill switch
+/// is a binary toggle that stays active until explicitly deactivated by an
+/// admin.
+///
+/// # Cost
+/// A single instance-storage read (`bool`) — negligible (~250 gas units)
+/// relative to any write entry point's existing storage reads/writes.
+///
+/// # Errors
+/// Returns [`KillSwitchError::WriteBlocked`] when the kill switch is active.
+pub fn require_no_active_kill_switch(env: &Env) -> Result<(), KillSwitchError> {
+    if is_kill_switch_active(env) {
+        Err(KillSwitchError::WriteBlocked)
+    } else {
+        Ok(())
+    }
+}
+
+/// Activate the kill switch, blocking all write operations.
+///
+/// Sets the `STORAGE_KILL_SWITCH` flag to `true`. After calling this,
+/// every write entry point that calls [`require_no_active_kill_switch`]
+/// will return [`KillSwitchError::WriteBlocked`].
+///
+/// This function does not enforce authentication — it is the caller's
+/// responsibility to gate it with admin auth (e.g.
+/// `admin.require_auth()` in the calling contract).
+pub fn activate_kill_switch(env: &Env) {
+    env.storage()
+        .instance()
+        .set(&STORAGE_KILL_SWITCH, &true);
+}
+
+/// Deactivate the kill switch, allowing write operations to proceed.
+///
+/// Removes the `STORAGE_KILL_SWITCH` flag from storage. After calling this,
+/// [`require_no_active_kill_switch`] will return `Ok(())` again.
+///
+/// If the kill switch is not active, this is a no-op.
+///
+/// This function does not enforce authentication — it is the caller's
+/// responsibility to gate it with admin auth.
+pub fn deactivate_kill_switch(env: &Env) {
+    env.storage().instance().remove(&STORAGE_KILL_SWITCH);
+}
+
+#[cfg(test)]
+mod kill_switch_tests {
+    use super::*;
+    use soroban_sdk::Env;
+
+    /// The kill switch is inactive by default (no storage set).
+    #[test]
+    fn test_kill_switch_inactive_by_default() {
+        let env = Env::default();
+        assert!(!is_kill_switch_active(&env));
+        assert_eq!(require_no_active_kill_switch(&env), Ok(()));
+    }
+
+    /// After activation, is_kill_switch_active returns true and
+    /// require_no_active_kill_switch returns WriteBlocked.
+    #[test]
+    fn test_activate_kill_switch_blocks_writes() {
+        let env = Env::default();
+        activate_kill_switch(&env);
+
+        assert!(is_kill_switch_active(&env));
+        assert_eq!(
+            require_no_active_kill_switch(&env),
+            Err(KillSwitchError::WriteBlocked)
+        );
+    }
+
+    /// After deactivation, the kill switch is inactive and writes are
+    /// allowed again.
+    #[test]
+    fn test_deactivate_kill_switch_allows_writes() {
+        let env = Env::default();
+        activate_kill_switch(&env);
+        assert!(is_kill_switch_active(&env));
+
+        deactivate_kill_switch(&env);
+        assert!(!is_kill_switch_active(&env));
+        assert_eq!(require_no_active_kill_switch(&env), Ok(()));
+    }
+
+    /// Deactivating when already inactive is a safe no-op.
+    #[test]
+    fn test_deactivate_kill_switch_is_idempotent() {
+        let env = Env::default();
+        assert!(!is_kill_switch_active(&env));
+
+        // Should not panic
+        deactivate_kill_switch(&env);
+        assert!(!is_kill_switch_active(&env));
+    }
+
+    /// After activation and deactivation, the kill switch can be
+    /// reactivated (toggle cycle).
+    #[test]
+    fn test_kill_switch_toggle_cycle() {
+        let env = Env::default();
+
+        // Activate
+        activate_kill_switch(&env);
+        assert!(is_kill_switch_active(&env));
+
+        // Deactivate
+        deactivate_kill_switch(&env);
+        assert!(!is_kill_switch_active(&env));
+
+        // Re-activate
+        activate_kill_switch(&env);
+        assert!(is_kill_switch_active(&env));
+        assert_eq!(
+            require_no_active_kill_switch(&env),
+            Err(KillSwitchError::WriteBlocked)
+        );
+
+        // Final deactivate
+        deactivate_kill_switch(&env);
+        assert!(!is_kill_switch_active(&env));
+    }
+
+    /// Negative test: require_no_active_kill_switch fails when kill switch
+    /// is active, and the error type is KillSwitchError::WriteBlocked.
+    #[test]
+    fn test_write_blocked_during_active_kill_switch() {
+        let env = Env::default();
+
+        // Without activation, writes allowed
+        assert!(require_no_active_kill_switch(&env).is_ok());
+
+        // Activate kill switch
+        activate_kill_switch(&env);
+
+        // Writes blocked
+        let result = require_no_active_kill_switch(&env);
+        assert_eq!(result, Err(KillSwitchError::WriteBlocked));
+    }
 }
 
 // ---------------------------------------------------------------------------
